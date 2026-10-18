@@ -220,8 +220,11 @@ func (c *Client) Login(ctx context.Context, qrOut io.Writer) error {
 				fmt.Fprintln(qrOut, "\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, qrOut)
 			case "success":
-				// Give the server a moment to persist the session.
-				time.Sleep(500 * time.Millisecond)
+				// Exiting straight away (as upstream did) leaves the phone
+				// showing a failed link, and WhatsApp then removes the device
+				// ("device_removed") on the next connect.
+				fmt.Fprintln(codeOut, "Linked. Finishing setup with WhatsApp; keep the phone open (up to 90 seconds)...")
+				c.waitAfterPair(ctx, connected)
 				return nil
 			case "timeout":
 				return errors.New("QR code scan timed out")
@@ -249,6 +252,21 @@ func (c *Client) PairPhoneLogin(ctx context.Context, phone string, codeOut io.Wr
 	if err != nil {
 		return fmt.Errorf("get QR channel: %w", err)
 	}
+
+	// After pairing, WhatsApp closes the socket (code 515) and the client
+	// reconnects as the new device. Watch for that reconnect so login can
+	// stay connected until the link is complete (see waitAfterPair).
+	connected := make(chan struct{}, 1)
+	hid := c.wa.AddEventHandler(func(evt interface{}) {
+		if _, ok := evt.(*events.Connected); ok {
+			select {
+			case connected <- struct{}{}:
+			default:
+			}
+		}
+	})
+	defer c.wa.RemoveEventHandler(hid)
+
 	if err := c.wa.ConnectContext(ctx); err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
@@ -269,8 +287,11 @@ func (c *Client) PairPhoneLogin(ctx context.Context, phone string, codeOut io.Wr
 			}
 			switch evt.Event {
 			case "success":
-				// Give the server a moment to persist the session.
-				time.Sleep(500 * time.Millisecond)
+				// Exiting straight away (as upstream did) leaves the phone
+				// showing a failed link, and WhatsApp then removes the device
+				// ("device_removed") on the next connect.
+				fmt.Fprintln(codeOut, "Linked. Finishing setup with WhatsApp; keep the phone open (up to 90 seconds)...")
+				c.waitAfterPair(ctx, connected)
 				return nil
 			case "timeout":
 				return errors.New("pairing code entry timed out")
@@ -281,6 +302,25 @@ func (c *Client) PairPhoneLogin(ctx context.Context, phone string, codeOut io.Wr
 				c.log.Warnf("pairing event: %s", evt.Event)
 			}
 		}
+	}
+}
+
+// waitAfterPair keeps the new linked device connected after a successful
+// pairing: first until the post-pairing reconnect completes (events.Connected,
+// up to 60 s), then 30 s more so WhatsApp and the phone can finish the link
+// and start the initial sync before login exits.
+func (c *Client) waitAfterPair(ctx context.Context, connected <-chan struct{}) {
+	select {
+	case <-connected:
+		c.log.Infof("Reconnected as the new linked device")
+	case <-time.After(60 * time.Second):
+		c.log.Warnf("No reconnect within 60 s after pairing; staying connected 30 s more anyway")
+	case <-ctx.Done():
+		return
+	}
+	select {
+	case <-time.After(30 * time.Second):
+	case <-ctx.Done():
 	}
 }
 

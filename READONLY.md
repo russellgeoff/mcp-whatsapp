@@ -19,7 +19,12 @@ What differs from upstream (the `readonly` branch, based on tag `v0.6.0`):
 - `.github/workflows/build-readonly-image.yml` — on every push to `readonly`,
   runs that test, builds the image for linux/amd64, boot-tests it, and
   publishes `ghcr.io/<owner>/mcp-whatsapp:<version>`.
-- `READONLY_VERSION` — the image tag to publish (e.g. `v0.6.0-ro1`).
+- `internal/client/client.go` — pairing fix (from `v0.6.0-ro2`): after a
+  phone-number pairing succeeds, `login` now stays connected until the
+  post-pairing reconnect completes, then 30 s more. Upstream exits 0.5 s after
+  success, which left the phone reporting a failed link and WhatsApp removing
+  the device ("device_removed") on the next connect.
+- `READONLY_VERSION` — the image tag to publish (e.g. `v0.6.0-ro2`).
 
 To update to a new upstream release: rebase `readonly` onto the new upstream
 tag, set `READONLY_VERSION` (e.g. `v0.7.0-ro1`) and push the branch.
