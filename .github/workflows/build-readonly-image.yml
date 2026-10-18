@@ -1,0 +1,47 @@
+# Builds the read-only image for Russell_NAS and publishes it to GitHub
+# Container Registry (ghcr.io/<owner>/mcp-whatsapp:<tag>).
+#
+# Runs when a tag like v0.6.0-ro1 is pushed, or by hand from the Actions tab.
+# The upstream test suite is not run here: it expects all 42 tools, and this
+# build deliberately exposes only the read-only ones. Instead, the read-only
+# test below must pass before anything is published.
+name: Build read-only image
+
+on:
+  push:
+    tags: ['v*-ro*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Check the read-only tool list
+        run: go test ./internal/mcp -run TestReadOnlyToolSet -v
+
+      - name: Set image name (registry names must be lower case)
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "IMAGE=ghcr.io/${owner}/mcp-whatsapp:${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+
+      - name: Build the image (linux/amd64, for the DS423+)
+        run: docker build --build-arg VERSION="${GITHUB_REF_NAME}" -t "$IMAGE" .
+
+      - name: Boot test (builds the server without connecting to WhatsApp)
+        run: docker run --rm "$IMAGE" smoke
+
+      - name: Publish to GitHub Container Registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "$IMAGE"
+          echo "Published $IMAGE" >> "$GITHUB_STEP_SUMMARY"
