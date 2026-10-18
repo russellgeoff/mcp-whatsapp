@@ -1,7 +1,9 @@
 # Builds the read-only image for Russell_NAS and publishes it to GitHub
 # Container Registry (ghcr.io/<owner>/mcp-whatsapp:<tag>).
 #
-# Runs when a tag like v0.6.0-ro1 is pushed, or by hand from the Actions tab.
+# Runs on every push to the readonly branch, or by hand from the Actions tab.
+# The image tag comes from the READONLY_VERSION file (e.g. v0.6.0-ro1), so
+# bump that file whenever the build changes.
 # The upstream test suite is not run here: it expects all 42 tools, and this
 # build deliberately exposes only the read-only ones. Instead, the read-only
 # test below must pass before anything is published.
@@ -9,7 +11,7 @@ name: Build read-only image
 
 on:
   push:
-    tags: ['v*-ro*']
+    branches: [readonly]
   workflow_dispatch:
 
 permissions:
@@ -32,10 +34,12 @@ jobs:
       - name: Set image name (registry names must be lower case)
         run: |
           owner="${GITHUB_REPOSITORY_OWNER,,}"
-          echo "IMAGE=ghcr.io/${owner}/mcp-whatsapp:${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          version="$(tr -d '[:space:]' < READONLY_VERSION)"
+          echo "VERSION=${version}" >> "$GITHUB_ENV"
+          echo "IMAGE=ghcr.io/${owner}/mcp-whatsapp:${version}" >> "$GITHUB_ENV"
 
       - name: Build the image (linux/amd64, for the DS423+)
-        run: docker build --build-arg VERSION="${GITHUB_REF_NAME}" -t "$IMAGE" .
+        run: docker build --build-arg VERSION="${VERSION}" -t "$IMAGE" .
 
       - name: Boot test (builds the server without connecting to WhatsApp)
         run: docker run --rm "$IMAGE" smoke

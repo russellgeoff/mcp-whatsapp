@@ -16,9 +16,10 @@ What differs from upstream (the `readonly` branch, based on tag `v0.6.0`):
   the `whatsapp://media/…` resource template.
 - `internal/mcp/readonly_test.go` — fails if the exposed tool set differs from
   the allowlist (for example if an upstream update adds or renames a tool).
-- `.github/workflows/build-readonly-image.yml` — runs that test, builds the
-  image for linux/amd64, boot-tests it, and publishes
-  `ghcr.io/<owner>/mcp-whatsapp:<tag>` when a `v*-ro*` tag is pushed.
+- `.github/workflows/build-readonly-image.yml` — on every push to `readonly`,
+  runs that test, builds the image for linux/amd64, boot-tests it, and
+  publishes `ghcr.io/<owner>/mcp-whatsapp:<version>`.
+- `READONLY_VERSION` — the image tag to publish (e.g. `v0.6.0-ro1`).
 
 To update to a new upstream release: rebase `readonly` onto the new upstream
-tag, push, then push a new tag such as `v0.7.0-ro1`.
+tag, set `READONLY_VERSION` (e.g. `v0.7.0-ro1`) and push the branch.
