@@ -203,6 +203,19 @@ func (c *Client) Login(ctx context.Context, qrOut io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("get QR channel: %w", err)
 	}
+
+	// Watch for the post-pairing reconnect (see waitAfterPair).
+	connected := make(chan struct{}, 1)
+	hid := c.wa.AddEventHandler(func(evt interface{}) {
+		if _, ok := evt.(*events.Connected); ok {
+			select {
+			case connected <- struct{}{}:
+			default:
+			}
+		}
+	})
+	defer c.wa.RemoveEventHandler(hid)
+
 	if err := c.wa.ConnectContext(ctx); err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
@@ -223,7 +236,7 @@ func (c *Client) Login(ctx context.Context, qrOut io.Writer) error {
 				// Exiting straight away (as upstream did) leaves the phone
 				// showing a failed link, and WhatsApp then removes the device
 				// ("device_removed") on the next connect.
-				fmt.Fprintln(codeOut, "Linked. Finishing setup with WhatsApp; keep the phone open (up to 90 seconds)...")
+				fmt.Fprintln(qrOut, "Linked. Finishing setup with WhatsApp; keep the phone open (up to 90 seconds)...")
 				c.waitAfterPair(ctx, connected)
 				return nil
 			case "timeout":

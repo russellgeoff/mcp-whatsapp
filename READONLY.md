@@ -20,7 +20,7 @@ What differs from upstream (the `readonly` branch, based on tag `v0.6.0`):
   runs that test, builds the image for linux/amd64, boot-tests it, and
   publishes `ghcr.io/<owner>/mcp-whatsapp:<version>`.
 - `internal/client/client.go` — pairing fix (from `v0.6.0-ro2`): after a
-  phone-number pairing succeeds, `login` now stays connected until the
+  pairing succeeds (phone-number code or QR), `login` now stays connected until the
   post-pairing reconnect completes, then 30 s more. Upstream exits 0.5 s after
   success, which left the phone reporting a failed link and WhatsApp removing
   the device ("device_removed") on the next connect.
