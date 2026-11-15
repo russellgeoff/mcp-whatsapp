@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"github.com/sealjay/mcp-whatsapp/internal/security"
 	"go.mau.fi/whatsmeow"
@@ -50,12 +49,28 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 // Download fetches media for a previously-cached message and writes it under
 // <StoreDir>/<chat_sanitized>/<hex(message_id)>/<filename>. If outputPath is non-empty, the
 // decrypted bytes are additionally placed at that location (validated against
-// the configured media root). The cache is always populated so subsequent
-// calls remain idempotent.
+// the configured media root). An outputPath that already holds the verified
+// payload is returned without touching the cache or the network; otherwise
+// the cache is populated so subsequent calls remain idempotent. Download
+// never contacts the phone; see DownloadWithMediaRetry.
 func (c *Client) Download(ctx context.Context, messageID, chatJID, outputPath string) DownloadResult {
+	return c.download(ctx, messageID, chatJID, outputPath, false)
+}
+
+// DownloadWithMediaRetry is Download for an explicit request for one message
+// (the download_media tool and media resource reads). When the CDN refuses
+// the stored link (403/404/410) it asks the account's own phone once to
+// re-upload the media and retries with the returned link. It persists that
+// link only after the payload passes validation. Automatic or bulk callers
+// use Download, so they never send retry receipts.
+func (c *Client) DownloadWithMediaRetry(ctx context.Context, messageID, chatJID, outputPath string) DownloadResult {
+	return c.download(ctx, messageID, chatJID, outputPath, true)
+}
+
+func (c *Client) download(ctx context.Context, messageID, chatJID, outputPath string, mediaRetry bool) DownloadResult {
 	// Validate output_path first so a bad path fails the call before any DB
-	// or network work. The skip-if-exists check waits until after we have
-	// the media metadata (so the success response carries the right fields).
+	// or network work. The existing-file check waits until after we have the
+	// media metadata it verifies against.
 	var resolvedOutput string
 	if outputPath != "" {
 		var err error
@@ -81,10 +96,18 @@ func (c *Client) Download(ctx context.Context, messageID, chatJID, outputPath st
 		}
 	}
 
-	// Skip-if-exists at the caller's destination: symmetric with the cache
-	// short-circuit below. Idempotent re-calls are a no-op.
+	// An existing file at the caller's destination is never replaced. A repeat
+	// call whose output is a regular file holding this message's payload
+	// (checked against the recorded SHA-256) succeeds straight away. Anything
+	// else, including a symlink, may be unrelated, so the call fails without
+	// reading through it.
 	if resolvedOutput != "" {
-		if _, statErr := os.Stat(resolvedOutput); statErr == nil {
+		info, statErr := os.Lstat(resolvedOutput)
+		switch {
+		case statErr == nil:
+			if !info.Mode().IsRegular() || len(fileSHA256) == 0 || validateCachedMedia(resolvedOutput, fileLength, fileSHA256) != nil {
+				return DownloadResult{Success: false, Message: fmt.Sprintf("output_path already exists and does not hold this media: %s; choose a new path or remove the file", resolvedOutput)}
+			}
 			return DownloadResult{
 				Success:   true,
 				Message:   fmt.Sprintf("Successfully downloaded %s media", mediaType),
@@ -92,6 +115,8 @@ func (c *Client) Download(ctx context.Context, messageID, chatJID, outputPath st
 				Filename:  filename,
 				Path:      resolvedOutput,
 			}
+		case !errors.Is(statErr, os.ErrNotExist):
+			return DownloadResult{Success: false, Message: fmt.Sprintf("failed to inspect output_path: %v", statErr)}
 		}
 	}
 
@@ -117,13 +142,12 @@ func (c *Client) Download(ctx context.Context, messageID, chatJID, outputPath st
 	}
 
 	// Short-circuit if we already have the file in cache. If output_path is
-	// set, materialise it there from the cache (cheap hardlink + copy
-	// fallback) and return the output path instead.
+	// set, copy it there from the cache and return the output path instead.
 	if _, statErr := os.Stat(localPath); statErr == nil {
 		if err := validateCachedMedia(localPath, fileLength, fileSHA256); err == nil {
 			return finalizeDownload(localPath, absPath, resolvedOutput, mediaType, filename)
 		} else {
-			c.log.Warnf("Ignoring invalid cached media for message %s: %v", c.redactor.MsgID(messageID), err)
+			c.log.Warnf("Ignoring invalid cached media for message %s: %s", c.redactor.MsgID(messageID), c.redactor.Err(err))
 		}
 	} else if !errors.Is(statErr, os.ErrNotExist) {
 		return DownloadResult{Success: false, Message: fmt.Sprintf("failed to inspect media cache: %v", statErr)}
@@ -159,13 +183,20 @@ func (c *Client) Download(ctx context.Context, messageID, chatJID, outputPath st
 		MediaType:     waMediaType,
 	}
 
-	var data []byte
-	if c.downloadMedia != nil {
-		data, err = c.downloadMedia(ctx, downloader)
-	} else if c.wa != nil {
-		data, err = c.wa.Download(ctx, downloader)
-	} else {
-		err = errors.New("media downloader is unavailable")
+	data, err := c.fetchMedia(ctx, downloader)
+	var retriedDirectPath string
+	if err != nil && mediaRetry && isExpiredMediaError(err) {
+		// The stored CDN path has expired (typical for history-synced
+		// messages) or the CDN dropped the file. Ask the phone to re-upload
+		// it, then try once more with the fresh path.
+		c.log.Infof("Media link for message %s no longer works (%s)", c.redactor.MsgID(messageID), c.redactor.Err(err))
+		newPath, retryErr := c.recoverMediaPath(ctx, messageID, chatJID, mediaKey)
+		if retryErr != nil {
+			return DownloadResult{Success: false, Message: fmt.Sprintf("failed to download media: %v; asking the phone to re-upload it failed: %v", err, retryErr)}
+		}
+		downloader.DirectPath = newPath
+		retriedDirectPath = newPath
+		data, err = c.fetchMedia(ctx, downloader)
 	}
 	if err != nil {
 		return DownloadResult{Success: false, Message: fmt.Sprintf("failed to download media: %v", err)}
@@ -174,12 +205,28 @@ func (c *Client) Download(ctx context.Context, messageID, chatJID, outputPath st
 	if err := validateMediaPayload(data, fileLength, fileSHA256); err != nil {
 		return DownloadResult{Success: false, Message: fmt.Sprintf("downloaded media failed validation: %v", err)}
 	}
+	if retriedDirectPath != "" {
+		if err := c.store.UpdateMediaDirectPath(messageID, chatJID, retriedDirectPath); err != nil {
+			c.log.Warnf("Failed to store re-uploaded media path for message %s: %s", c.redactor.MsgID(messageID), c.redactor.Err(err))
+		}
+	}
 	if err := replaceCacheFile(messageDir, localPath, data); err != nil {
 		return DownloadResult{Success: false, Message: fmt.Sprintf("failed to save media file: %v", err)}
 	}
 
 	c.log.Infof("Successfully downloaded %s media (%d bytes)", mediaType, len(data))
 	return finalizeDownload(localPath, absPath, resolvedOutput, mediaType, filename)
+}
+
+// fetchMedia downloads and decrypts the payload described by d.
+func (c *Client) fetchMedia(ctx context.Context, d *MediaDownloader) ([]byte, error) {
+	if c.downloadMedia != nil {
+		return c.downloadMedia(ctx, d)
+	}
+	if c.wa != nil {
+		return c.wa.Download(ctx, d)
+	}
+	return nil, errors.New("media downloader is unavailable")
 }
 
 func validateCachedMedia(path string, fileLength uint64, fileSHA256 []byte) error {
@@ -262,19 +309,11 @@ func finalizeDownload(localPath, absPath, resolvedOutput, mediaType, filename st
 	}
 }
 
-// placeAtOutput materialises src at dst. Prefers a hard link (zero-copy, O(1))
-// and falls back to a stream copy on cross-device (EXDEV). If dst already
-// exists, returns nil — the caller has already cleared the skip-if-exists
-// check, so EEXIST here is a benign race and the file satisfies the request.
+// placeAtOutput copies src to dst as an independent file; a hard link would
+// let writes through dst modify the cached file. O_EXCL never truncates,
+// replaces or follows an existing dst, and a failed copy removes the partial
+// file so the caller can retry the same path.
 func placeAtOutput(src, dst string) error {
-	if err := os.Link(src, dst); err == nil {
-		return nil
-	} else if errors.Is(err, syscall.EEXIST) {
-		return nil
-	} else if !errors.Is(err, syscall.EXDEV) {
-		return err
-	}
-	// Cross-device — fall back to a copy.
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -282,16 +321,16 @@ func placeAtOutput(src, dst string) error {
 	defer in.Close()
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		if errors.Is(err, syscall.EEXIST) {
-			return nil
-		}
 		return err
 	}
-	defer out.Close()
-	if _, err := io.Copy(out, in); err != nil {
-		return err
+	_, err = io.Copy(out, in)
+	if closeErr := out.Close(); err == nil {
+		err = closeErr
 	}
-	return out.Close()
+	if err != nil {
+		os.Remove(dst)
+	}
+	return err
 }
 
 // preferredDirectPath picks the value handed to whatsmeow as the download's

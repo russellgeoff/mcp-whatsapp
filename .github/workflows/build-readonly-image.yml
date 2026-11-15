@@ -4,7 +4,7 @@
 # Runs on every push to the readonly branch, or by hand from the Actions tab.
 # The image tag comes from the READONLY_VERSION file (e.g. v0.6.0-ro1), so
 # bump that file whenever the build changes.
-# The upstream test suite is not run here: it expects all 42 tools, and this
+# The upstream test suite is not run here: it expects all 43 tools, and this
 # build deliberately exposes only the read-only ones. Instead, the read-only
 # test below must pass before anything is published.
 name: Build read-only image

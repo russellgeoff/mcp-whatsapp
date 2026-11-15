@@ -64,12 +64,12 @@ type listMessagesArgs struct {
 
 func (s *Server) registerListMessages() {
 	tool := mcp.NewTool("list_messages",
-		mcp.WithDescription(offlineSafePrefix+"Search and page through cached WhatsApp messages, optionally filtering by chat, sender, time range, and substring; can include surrounding context messages. Read-only; no side effects. Use get_message_context to expand around a single known message ID, or request_sync to backfill missing history. Returns a human-readable formatted text block listing matching messages."),
+		mcp.WithDescription(offlineSafePrefix+"Search and page through cached WhatsApp messages, optionally filtering by chat, sender, time range, and substring; can include surrounding context messages. Read-only; no side effects. Use get_message_context to expand around a single known message ID, or request_sync to backfill missing history. Returns a human-readable formatted text block listing matching messages; edited messages show an `[edited]` marker and messages deleted for everyone keep their text behind a `[deleted <time> UTC]` marker."),
 		mcp.WithString("after", mcp.Description("ISO-8601 UTC lower bound on message timestamp (inclusive)")),
 		mcp.WithString("before", mcp.Description("ISO-8601 UTC upper bound on message timestamp (inclusive)")),
 		mcp.WithString("sender_phone_number", mcp.Description("filter to messages sent by this phone or JID ("+jidDesc+")")),
 		mcp.WithString("chat_jid", mcp.Description("filter to messages in this chat ("+jidDesc+")")),
-		mcp.WithString("query", mcp.Description("case-insensitive substring to match within message body")),
+		mcp.WithString("query", mcp.Description("case-insensitive substring to match within message body (text, or the caption of an image, video or document; edited messages match their latest text; messages deleted for everyone still match)")),
 		mcp.WithNumber("limit", mcp.DefaultNumber(20), mcp.Description("max messages to return (default 20, capped at 100 server-side)")),
 		mcp.WithNumber("page", mcp.DefaultNumber(0), mcp.Description("zero-based page index for paging through results (default 0)")),
 		mcp.WithBoolean("include_context", mcp.DefaultBool(true), mcp.Description("if true, attach a few surrounding messages to each match (defaults to true)")),
@@ -203,7 +203,7 @@ type getMessageContextArgs struct {
 
 func (s *Server) registerGetMessageContext() {
 	tool := mcp.NewTool("get_message_context",
-		mcp.WithDescription(offlineSafePrefix+"Fetch a specific cached message and the surrounding messages in its chat. Read-only; no side effects. Use list_messages for searching across many chats. Returns a JSON object with the target message and arrays of messages before and after it."),
+		mcp.WithDescription(offlineSafePrefix+"Fetch a specific cached message and the surrounding messages in its chat. Read-only; no side effects. Use list_messages for searching across many chats. Returns a JSON object with the target message and arrays of messages before and after it; messages carry `edited: true` when edited, and `revoked: true` with `revoked_at` when deleted for everyone (their text and media are kept)."),
 		mcp.WithString("message_id", mcp.Required(), mcp.Description("WhatsApp message ID of the target message (use `message_id` from list_messages)")),
 		mcp.WithNumber("before", mcp.DefaultNumber(5), mcp.Description("messages to fetch before the target (default 5; non-positive values fall back to the default)")),
 		mcp.WithNumber("after", mcp.DefaultNumber(5), mcp.Description("messages to fetch after the target (default 5; non-positive values fall back to the default)")),
@@ -260,7 +260,7 @@ func (s *Server) registerIsOnWhatsApp() {
 
 func (s *Server) registerGetStatus() {
 	tool := mcp.NewTool("get_status",
-		mcp.WithDescription("Report whether the embedded WhatsApp bridge is connected and which account it is paired with. Read-only; no side effects. Call this first when other tools fail with auth or connection errors. Returns a JSON object `{connected, paired, own_jid?, own_phone?, hint?}` — `hint` includes the URL of the local pairing UI when not yet paired."),
+		mcp.WithDescription("Report the WhatsApp connection state and its transition time, paired account, and read-only mode. Read-only with no side effects; use when other tools fail with auth or connection errors. Returns `{connected, paired, connection_state, connection_state_since, read_only, own_jid?, own_phone?, hint?}`; `hint` gives the pairing UI when unpaired."),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithIdempotentHintAnnotation(true),
@@ -269,7 +269,11 @@ func (s *Server) registerGetStatus() {
 	s.mcp.AddTool(tool, func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		status := map[string]any{
 			"connected": s.client.IsConnected(),
+			"read_only": s.readOnly,
 		}
+		connection := s.client.ConnectionStatus()
+		status["connection_state"] = connection.State
+		status["connection_state_since"] = connection.Since
 		if wa := s.client.WA(); wa != nil && wa.Store != nil && wa.Store.ID != nil {
 			status["own_jid"] = wa.Store.ID.String()
 			status["own_phone"] = wa.Store.ID.User
@@ -293,7 +297,7 @@ func (s *Server) registerGetStatus() {
 // keeping the awaiting_qr / error envelopes free of any whatsmeow dependency.
 func (s *Server) registerPairingStatus() {
 	tool := mcp.NewTool("pairing_status",
-		mcp.WithDescription("Report the WhatsApp device-pairing state as a structured `setup_state` envelope for programmatic supervisors that surface the linking QR to their own clients (e.g. a polling daemon). Read-only; no side effects. Returns a JSON object `{type:\"setup_state\", state, …}` where `state` is `ready` (paired and connected; adds own_jid/own_phone), `awaiting_qr` (unpaired; adds qr_payload when a pairing code is cached), or `error` (pairing cache unavailable)."),
+		mcp.WithDescription("Report the WhatsApp device-pairing state as a structured `setup_state` envelope for programmatic supervisors that surface the linking QR to their own clients (e.g. a polling daemon). Read-only; no side effects. Returns a JSON object `{type:\"setup_state\", state, …}` where `state` is `ready` (paired and connected; adds own_jid/own_phone), `awaiting_qr` (unpaired; adds qr_payload when a pairing code is cached, or expired=true when the last pairing session expired and a new one starts once /pair is opened or a pairing code is requested), or `error` (pairing cache unavailable)."),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithIdempotentHintAnnotation(true),
@@ -325,6 +329,10 @@ func (s *Server) registerPairingStatus() {
 			resp["state"] = "awaiting_qr"
 			resp["qr_payload"] = s.cache.QR()
 			resp["detail"] = "Scan with WhatsApp → Linked devices"
+		case s.cache.Expired():
+			resp["state"] = "awaiting_qr"
+			resp["expired"] = true
+			resp["detail"] = "Pairing session expired; open /pair or request a pairing code to start a new one"
 		default:
 			resp["state"] = "awaiting_qr"
 			resp["detail"] = "Generating pairing code…"

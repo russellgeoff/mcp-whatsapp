@@ -29,16 +29,21 @@ Commands:
   login   Pair this device with your WhatsApp account via QR code (terminal)
   serve   Run the always-on HTTP MCP daemon (tracks events + serves MCP on 127.0.0.1:8765)
   smoke   Non-interactive boot check (CI): opens store + builds MCP server without connecting
+  healthcheck  Probe local daemon readiness (for container health checks)
   help    Show this help
 
 Global flags (before the command):
   -store DIR   Directory holding messages.db and whatsapp.db (default: ./store)
-  -debug       Show full JIDs and message bodies in logs (default: redacted)
+  -debug       Show full JIDs, names and message bodies in logs (default: redacted)
   -version     Print version and exit
 
 Serve-specific flags (after 'serve'):
   -addr host:port   HTTP bind address (default: 127.0.0.1:8765, env WHATSAPP_MCP_ADDR)
   -allow-remote     Allow binding to a non-loopback address (dangerous)
+Pairing flag (after 'login' or 'serve'; only affects a new pairing):
+  -full-history     Ask the phone for a full history sync (env WHATSAPP_MCP_FULL_HISTORY)
+  -read-only        Exclude WhatsApp mutation tools (env WHATSAPP_MCP_READ_ONLY)
+  -enable-labels    Enable WhatsApp Business label sync and tools (env WHATSAPP_MCP_LABELS)
 `
 
 func main() {
@@ -65,7 +70,7 @@ func main() {
 	fs := flag.NewFlagSet("whatsapp-mcp", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	fs.StringVar(&storeDir, "store", "./store", "directory holding messages.db and whatsapp.db")
-	fs.BoolVar(&debug, "debug", false, "show full JIDs and message bodies in logs (default: redacted)")
+	fs.BoolVar(&debug, "debug", false, "show full JIDs, names and message bodies in logs (default: redacted)")
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
@@ -91,6 +96,8 @@ func main() {
 		code = runServe(storeDir, redactor, rest)
 	case "smoke":
 		code = runSmoke(storeDir, redactor, rest)
+	case "healthcheck":
+		code = runHealthcheck(rest)
 	case "help", "-h", "--help":
 		fmt.Fprint(os.Stdout, usage)
 		code = 0

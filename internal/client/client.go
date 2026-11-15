@@ -8,19 +8,23 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/mdp/qrterminal"
 
 	"go.mau.fi/whatsmeow"
+	waProto "go.mau.fi/whatsmeow/binary/proto"
 	wmstore "go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
+	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
 	"github.com/sealjay/mcp-whatsapp/internal/ratelimit"
 	"github.com/sealjay/mcp-whatsapp/internal/security"
 	"github.com/sealjay/mcp-whatsapp/internal/store"
+	"github.com/sealjay/mcp-whatsapp/internal/transcribe"
 )
 
 // Config configures a new Client.
@@ -30,17 +34,23 @@ type Config struct {
 	Logger           waLog.Logger       // optional; defaults to stderr at INFO
 	AllowedMediaRoot string             // absolute path; media_path args must live under this
 	Redactor         *security.Redactor // optional; defaults to a redacting instance
+	LabelsEnabled    bool               // opt in to full app-state events for label sync; default false
 	// RateLimiter throttles outbound sends and usync lookups. Optional; New
 	// installs one built from ratelimit.DefaultConfig when nil. Pass an
 	// explicitly-configured limiter to override the defaults, or leave the
 	// field nil on a Client literal (as unit tests do) to disable limiting.
 	RateLimiter *ratelimit.Limiter
+	// FullHistory asks the phone for a full history sync when this device
+	// links (see RequestFullHistory). False keeps whatsmeow's defaults.
+	FullHistory bool
 }
 
 // Client wraps a whatsmeow.Client together with the message cache and logger.
 type Client struct {
 	wa               *whatsmeow.Client
 	downloadMedia    func(context.Context, whatsmeow.DownloadableMessage) ([]byte, error)
+	groupInfo        func(context.Context, types.JID) (*types.GroupInfo, error)
+	sendMediaRetry   func(context.Context, *types.MessageInfo, []byte) error
 	store            *store.Store
 	log              waLog.Logger
 	handlerID        uint32
@@ -48,6 +58,37 @@ type Client struct {
 	allowedMediaRoot string
 	redactor         *security.Redactor
 	limiter          *ratelimit.Limiter
+	labelsEnabled    bool
+	statusMu         sync.RWMutex
+	status           ConnectionStatus
+
+	// mediaRetries tracks media retry receipts awaiting the phone's answer
+	// (see mediaretry.go); mediaRetryTimeout overrides
+	// defaultMediaRetryTimeout when positive.
+	mediaRetries      mediaRetryRegistry
+	mediaRetryTimeout time.Duration
+	// mediaRetryGroupInfo and mediaRetryLIDs replace wa.GetGroupInfo and the
+	// device's LID store in tests (see mediaRetrySender).
+	mediaRetryGroupInfo func(context.Context, types.JID) (*types.GroupInfo, error)
+	mediaRetryLIDs      wmstore.LIDStore
+	// Speech-to-text (see transcribe.go). transcribeFn is a test seam.
+	transcribeCfg transcribe.Config
+	transcribeFn  func(ctx context.Context, cfg transcribe.Config, path, language string) (transcribe.Result, error)
+	transcribeMu  sync.Mutex
+	// isConnected and waSend are wa's IsConnected and SendMessage, used by
+	// SendReply, SendReaction, polls and contact cards (waSend through the
+	// rate-limited sendMessage); tests replace them.
+	isConnected func() bool
+	waSend      func(context.Context, types.JID, *waProto.Message, ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error)
+}
+
+// newWAClient creates the whatsmeow client for device. whatsmeow logs through
+// a redactingLogger, so the JIDs in its own log lines are masked like ours.
+func newWAClient(device *wmstore.Device, logger waLog.Logger, redactor *security.Redactor, labelsEnabled bool) *whatsmeow.Client {
+	wa := whatsmeow.NewClient(device, redactingLogger{inner: logger, redactor: redactor})
+	// whatsmeow reads this during sync; configure it before Connect and never toggle it.
+	wa.EmitAppStateEventsOnFullSync = labelsEnabled
+	return wa
 }
 
 // New constructs a Client. It sets the latest WhatsApp version best-effort,
@@ -76,6 +117,12 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		limiter = ratelimit.New(ratelimit.DefaultConfig())
 	}
 
+	// Pairing properties are read when the handshake is built, so they
+	// must be in place before the first Connect.
+	if cfg.FullHistory {
+		RequestFullHistory()
+	}
+
 	// Best-effort: fetch the latest WhatsApp version so the server doesn't
 	// reject us as outdated. Failure here is non-fatal.
 	if latest, err := whatsmeow.GetLatestVersion(ctx, nil); err != nil {
@@ -98,7 +145,7 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 
 	dbLog := NewStderrLogger("Database", "INFO", true)
 	waPath := filepath.Join(cfg.StoreDir, "whatsapp.db")
-	container, err := sqlstore.New(ctx, "sqlite3", "file:"+waPath+"?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(ctx, "sqlite3", "file:"+waPath+"?_foreign_keys=on", redactingLogger{inner: dbLog, redactor: redactor})
 	if err != nil {
 		return nil, fmt.Errorf("open whatsmeow sqlstore: %w", err)
 	}
@@ -117,8 +164,15 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 			return nil, fmt.Errorf("get device: %w", err)
 		}
 	}
+	if cfg.FullHistory {
+		if device.ID != nil {
+			logger.Warnf("Full history sync requested, but this device is already linked: it only applies to a new pairing")
+		} else {
+			logger.Infof("Will ask the phone for a full history sync when pairing")
+		}
+	}
 
-	wa := whatsmeow.NewClient(device, logger)
+	wa := newWAClient(device, logger, redactor, cfg.LabelsEnabled)
 	if wa == nil {
 		return nil, errors.New("failed to create whatsmeow client")
 	}
@@ -126,11 +180,18 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	return &Client{
 		wa:               wa,
 		downloadMedia:    wa.Download,
+		sendMediaRetry:   wa.SendMediaRetryReceipt,
+		isConnected:      wa.IsConnected,
+		waSend:           wa.SendMessage,
+		groupInfo:        wa.GetGroupInfo,
 		store:            cfg.Store,
 		log:              logger,
 		allowedMediaRoot: cfg.AllowedMediaRoot,
 		redactor:         redactor,
 		limiter:          limiter,
+		labelsEnabled:    cfg.LabelsEnabled,
+		status:           ConnectionStatus{State: "disconnected", Since: time.Now().UTC()},
+		transcribeCfg:    transcribe.ConfigFromEnv(),
 	}, nil
 }
 
@@ -163,11 +224,28 @@ func (c *Client) QRChannel(ctx context.Context) (<-chan whatsmeow.QRChannelItem,
 	return c.wa.GetQRChannel(ctx)
 }
 
+// NewPairingSession creates an independent whatsmeow client for one pairing
+// attempt while sharing the device store, so its connection teardown cannot
+// affect this Client's connection.
+func (c *Client) NewPairingSession() *Client {
+	return &Client{
+		wa:            newWAClient(c.wa.Store, c.log, c.redactor, c.labelsEnabled),
+		store:         c.store,
+		log:           c.log,
+		redactor:      c.redactor,
+		labelsEnabled: c.labelsEnabled,
+	}
+}
+
 // Logout drops the currently paired device from WhatsApp's server and clears
 // the local session. After this call, IsLoggedIn returns false and the next
 // Connect will start a fresh pairing flow.
 func (c *Client) Logout(ctx context.Context) error {
-	return c.wa.Logout(ctx)
+	if err := c.wa.Logout(ctx); err != nil {
+		return err
+	}
+	c.trackConnectionEvent(&events.LoggedOut{})
+	return nil
 }
 
 // ConnectOpts controls the behaviour of Connect.
@@ -342,6 +420,7 @@ func (c *Client) Disconnect() {
 	if c.wa != nil {
 		c.wa.Disconnect()
 	}
+	c.trackConnectionEvent(&events.Disconnected{})
 }
 
 // IsConnected reports whether the underlying whatsmeow client currently

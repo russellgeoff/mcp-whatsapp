@@ -91,6 +91,45 @@ func TestStorePollMetadata_NoOpWhenNoMessageRow(t *testing.T) {
 	}
 }
 
+func TestRevokedPollKeepsArchiveWithoutAcceptingHistoryUpdates(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	const chat, id, sender, voter = "123456789@g.us", "poll-revoked", "447700000001", "447700000002@s.whatsapp.net"
+	ts := time.Date(2026, 2, 1, 9, 0, 0, 0, time.UTC)
+
+	if err := s.StoreMessage(ctx, Message{
+		ID: id, ChatJID: chat, Sender: sender, Content: "[poll] lunch?", Timestamp: ts,
+	}, nil, nil, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StorePollMetadata(ctx, id, chat, []string{"sushi", "pizza"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StorePollVote(ctx, id, chat, voter, []string{"sushi"}, ts); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.ApplyRevoke(ctx, chat, id, Author{Senders: []string{sender}}, ts.Add(time.Minute)); err != nil || !ok {
+		t.Fatalf("ApplyRevoke = %v, %v; want applied", ok, err)
+	}
+
+	if err := s.StorePollMetadata(ctx, id, chat, []string{"history update"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StorePollVote(ctx, id, chat, voter, []string{"pizza"}, ts.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	opts, results, err := s.GetPollResults(ctx, id, chat)
+	if err != nil {
+		t.Fatalf("GetPollResults: %v", err)
+	}
+	if len(opts) != 2 || opts[0] != "sushi" || opts[1] != "pizza" {
+		t.Fatalf("archived poll options = %v; want [sushi pizza]", opts)
+	}
+	if len(results) != 2 || results[0] != (PollResult{Option: "sushi", Votes: 1}) || results[1] != (PollResult{Option: "pizza", Votes: 0}) {
+		t.Fatalf("archived poll results = %+v; want original vote unchanged", results)
+	}
+}
+
 func TestStorePollVote_Replacement(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
@@ -365,6 +404,57 @@ func TestMigrateSchema_AddsPollOptionsColumn(t *testing.T) {
 	// Column count must not double.
 	if count := columnCount(t, db, "messages", "poll_options_json"); count != 1 {
 		t.Fatalf("expected exactly 1 poll_options_json column, got %d", count)
+	}
+}
+
+func TestMigrateSchema_RekeysDevicePollVoters(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	const chat = "447700000001@s.whatsapp.net"
+	if err := s.StorePollMetadata(ctx, "poll-1", chat, []string{"Yes", "No"}); err != nil {
+		t.Fatalf("StorePollMetadata: %v", err)
+	}
+	// Votes as older versions stored them: one account voting from two
+	// devices and earlier without a suffix, and an unresolved LID device.
+	for _, v := range []struct {
+		voter, option string
+		at            time.Time
+	}{
+		{"447700000001@s.whatsapp.net", "Yes", time.Date(2026, 1, 1, 9, 0, 0, 0, time.UTC)},
+		{"447700000001:7@s.whatsapp.net", "No", time.Date(2026, 1, 1, 11, 0, 0, 0, time.UTC)},
+		{"447700000001:5@s.whatsapp.net", "Yes", time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)},
+		{"123456789:3@lid", "Yes", time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)},
+	} {
+		if _, err := s.db.Exec(`INSERT INTO poll_votes VALUES ('poll-1', ?, ?, ?, ?)`, chat, v.voter, `["`+v.option+`"]`, v.at); err != nil {
+			t.Fatalf("seed vote %s: %v", v.voter, err)
+		}
+	}
+
+	for i := 0; i < 2; i++ {
+		if err := migrateSchema(s.db); err != nil {
+			t.Fatalf("migrateSchema run %d: %v", i+1, err)
+		}
+	}
+
+	got := map[string]string{}
+	rows, err := s.db.Query(`SELECT voter_jid, selected_options_json FROM poll_votes`)
+	if err != nil {
+		t.Fatalf("query votes: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var voter, selected string
+		if err := rows.Scan(&voter, &selected); err != nil {
+			t.Fatalf("scan vote: %v", err)
+		}
+		got[voter] = selected
+	}
+	want := map[string]string{
+		"447700000001@s.whatsapp.net": `["No"]`,
+		"123456789@lid":               `["Yes"]`,
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("votes after migration = %v, want %v", got, want)
 	}
 }
 

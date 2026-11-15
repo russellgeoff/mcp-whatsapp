@@ -34,7 +34,7 @@ type editMessageArgs struct {
 
 func (s *Server) registerEditMessage() {
 	tool := mcp.NewTool("edit_message",
-		mcp.WithDescription("Edit a previously-sent text message in place; recipients see the new body with an `edited` label. Only your own messages can be edited and only within WhatsApp's edit window (~15 minutes). Re-edit by calling again with another `new_body`; to remove the message entirely use delete_message (revoke). Returns the plain-text string `Message edited` on success."),
+		mcp.WithDescription("Edit a previously-sent text message in place; recipients see the new body with an `edited` label and the cached row takes the new body. Only your own messages can be edited and only within WhatsApp's edit window (~15 minutes). Re-edit by calling again with another `new_body`; to remove the message entirely use delete_message (revoke). Returns the plain-text string `Message edited` on success."),
 		mcp.WithString("chat_jid", mcp.Required(), mcp.Description(jidDesc)),
 		mcp.WithString("message_id", mcp.Required(), mcp.Description("WhatsApp message ID of your own message to edit (use `message_id` from list_messages)")),
 		mcp.WithString("new_body", mcp.Required(), mcp.Description("replacement message body text")),
@@ -61,7 +61,7 @@ type deleteMessageArgs struct {
 
 func (s *Server) registerDeleteMessage() {
 	tool := mcp.NewTool("delete_message",
-		mcp.WithDescription("Revoke (delete-for-everyone) a message; recipients see a `message was deleted` notice and the local cache row is marked revoked. Permanent — there is no undo, and the original body cannot be restored once revoked. You can only delete your own messages unless you are a group admin. Use edit_message instead when you only want to correct text. Returns the plain-text string `Message deleted` on success."),
+		mcp.WithDescription("Revoke (delete-for-everyone) a message; recipients see a `message was deleted` notice and the local cache row is marked deleted (with the time) and keeps its text and media. Permanent for recipients — there is no undo. You can only delete your own messages unless you are a group admin. Use edit_message instead when you only want to correct text. Returns the plain-text string `Message deleted` on success."),
 		mcp.WithString("chat_jid", mcp.Required(), mcp.Description(jidDesc)),
 		mcp.WithString("message_id", mcp.Required(), mcp.Description("WhatsApp message ID of the message to revoke (use `message_id` from list_messages)")),
 		mcp.WithString("sender_jid", mcp.Description("JID of the original sender; required when deleting someone else's message as a group admin, leave empty when deleting your own ("+jidDesc+")")),
@@ -238,10 +238,10 @@ type downloadMediaArgs struct {
 
 func (s *Server) registerDownloadMedia() {
 	tool := mcp.NewTool("download_media",
-		mcp.WithDescription("Fetch the encrypted media payload (image, video, audio, document) for a previously-cached message, decrypt it, and write it to a local file under the store directory; returns the absolute path. For image and audio downloads at most 5 MiB, the decrypted bytes are ALSO embedded in the tool result as an ImageContent or AudioContent block so remote MCP clients can view or hear the payload without accessing the daemon's filesystem. Videos and documents are not embedded (too large or not renderable inline). Optionally also writes the decrypted file to `output_path`, which must live under the configured media root (`WHATSAPP_MCP_MEDIA_ROOT`, default `<store>/uploads/`). No notification is sent to the sender or chat. Idempotent — repeated calls for the same message return the cached file path. Prerequisite: the message must contain media; use list_messages to find media message IDs. Returns a JSON object `{Success, Message, MediaType, Filename, Path}` as the first content block, followed by an optional ImageContent/AudioContent block for renderable media."),
+		mcp.WithDescription("Fetch the encrypted media payload (image, video, audio, document) for a previously-cached message, decrypt it, and write it to a local file under the store directory; returns the absolute path. For image and audio downloads at most 5 MiB, the decrypted bytes are ALSO embedded in the tool result as an ImageContent or AudioContent block so remote MCP clients can view or hear the payload without accessing the daemon's filesystem. Videos and documents are not embedded (too large or not renderable inline). Optionally also writes the decrypted file to `output_path`, which must live under the configured media root (`WHATSAPP_MCP_MEDIA_ROOT`, default `<store>/uploads/`). If WhatsApp's CDN refuses the stored media link (HTTP 403/404/410, typical for media from history sync, whose signed links expire), the daemon asks the account's own phone once to re-upload the file, waits up to 30 seconds for its answer, downloads once more, validates the payload against the cached size and SHA-256, and only then stores the verified link; the phone must be online, and if it no longer has the file the call fails saying so. Recovery also works in read-only mode: the request goes only to the account's own phone, and no notification is sent to the sender or chat. Idempotent — repeated calls for the same message return the cached file path. Prerequisite: the message must contain media; use list_messages to find media message IDs. Returns a JSON object `{Success, Message, MediaType, Filename, Path}` as the first content block, followed by an optional ImageContent/AudioContent block for renderable media."),
 		mcp.WithString("message_id", mcp.Required(), mcp.Description("WhatsApp message ID of a media message (use `message_id` from list_messages)")),
 		mcp.WithString("chat_jid", mcp.Required(), mcp.Description(jidDesc)),
-		mcp.WithString("output_path", mcp.Description("optional absolute path under the configured media root (`WHATSAPP_MCP_MEDIA_ROOT`, default `<store>/uploads/`); parent directory must exist; calls are skipped if the file already exists; omit to write only to the daemon cache")),
+		mcp.WithString("output_path", mcp.Description("optional absolute path under the configured media root (`WHATSAPP_MCP_MEDIA_ROOT`, default `<store>/uploads/`); parent directory must exist; an existing file is left untouched and the call succeeds only if it already holds identical media, otherwise it fails; omit to write only to the daemon cache")),
 		mcp.WithReadOnlyHintAnnotation(false),
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithIdempotentHintAnnotation(true),
@@ -251,7 +251,7 @@ func (s *Server) registerDownloadMedia() {
 		if a.MessageID == "" || a.ChatJID == "" {
 			return mcp.NewToolResultError("message_id and chat_jid are required"), nil
 		}
-		r := s.client.Download(ctx, a.MessageID, a.ChatJID, a.OutputPath)
+		r := s.client.DownloadWithMediaRetry(ctx, a.MessageID, a.ChatJID, a.OutputPath)
 		return downloadMediaResult(r)
 	}))
 }

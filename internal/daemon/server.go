@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -19,8 +20,10 @@ type pairDriver interface {
 	IsLoggedIn() bool
 	// StartPairing begins an unpaired session. onQR is invoked every time
 	// whatsmeow emits a new pairing code. onSuccess is invoked once
-	// pairing succeeds.
-	StartPairing(ctx context.Context, onQR func(code string), onSuccess func()) error
+	// pairing succeeds. onExpired is invoked if the session ends without
+	// pairing (WhatsApp closes an unused session once its QR codes run out,
+	// or the socket dropped); a new StartPairing call is needed after it.
+	StartPairing(ctx context.Context, onQR func(code string), onSuccess func(), onExpired func()) error
 	// Connect attaches event handlers (including LoggedOut) on an already-
 	// paired session. onLoggedOut fires when the remote device revokes the
 	// session.
@@ -48,6 +51,7 @@ type Config struct {
 type Server struct {
 	cfg   Config
 	cache *PairCache
+	flow  *pairFlow
 
 	mu         sync.Mutex
 	httpServer *http.Server
@@ -63,9 +67,11 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Driver == nil {
 		return nil, errors.New("daemon.New: Driver required")
 	}
+	cache := NewPairCache()
 	return &Server{
 		cfg:        cfg,
-		cache:      NewPairCache(),
+		cache:      cache,
+		flow:       newPairFlow(cfg.Driver, cache),
 		listenerOK: make(chan struct{}),
 	}, nil
 }
@@ -99,7 +105,20 @@ func (s *Server) Run(ctx context.Context) error {
 		coder = pc
 	}
 	handlers := newPairHandlers(s.cache, s.cfg.Driver, coder)
+	handlers.flow = s.flow
 	handlers.mount(mux)
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		writeProbe(w, http.StatusOK, "ok", true)
+	})
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
+		driver, ok := s.cfg.Driver.(interface{ IsConnected() bool })
+		ready := ok && s.cache.Paired() && driver.IsConnected()
+		code := http.StatusServiceUnavailable
+		if ready {
+			code = http.StatusOK
+		}
+		writeProbe(w, code, "ready", ready)
+	})
 	if s.cfg.MCPMount != nil {
 		s.cfg.MCPMount(mux)
 	} else {
@@ -154,35 +173,37 @@ func (s *Server) Run(ctx context.Context) error {
 	return nil
 }
 
+func writeProbe(w http.ResponseWriter, code int, key string, value bool) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(map[string]bool{key: value})
+}
+
 // bootDriver inspects the driver's IsLoggedIn and either starts pairing
 // or connects with the existing session. Safe to call only once per Run.
 func (s *Server) bootDriver(ctx context.Context) error {
-	onQR := func(code string) { s.cache.SetQR(code) }
 	onPairSuccess := func() {
-		s.cache.SetPaired()
 		// Transition into Connect to install the LoggedOut handler.
-		_ = s.cfg.Driver.Connect(ctx, s.onLoggedOut(ctx))
+		_ = s.cfg.Driver.Connect(ctx, s.onLoggedOut())
 	}
 
 	if s.cfg.Driver.IsLoggedIn() {
 		s.cache.SetPaired()
-		return s.cfg.Driver.Connect(ctx, s.onLoggedOut(ctx))
+		s.flow.bind(ctx, onPairSuccess)
+		return s.cfg.Driver.Connect(ctx, s.onLoggedOut())
 	}
-	return s.cfg.Driver.StartPairing(ctx, onQR, onPairSuccess)
+	s.flow.bind(ctx, onPairSuccess)
+	return s.flow.start()
 }
 
 // onLoggedOut returns a callback the driver invokes when the remote device
 // revokes the session. Flips the cache to unpaired and kicks the pairing
 // flow back up.
-func (s *Server) onLoggedOut(ctx context.Context) func() {
+func (s *Server) onLoggedOut() func() {
 	return func() {
 		s.cache.Reset()
-		onQR := func(code string) { s.cache.SetQR(code) }
-		onPairSuccess := func() {
-			s.cache.SetPaired()
-			_ = s.cfg.Driver.Connect(ctx, s.onLoggedOut(ctx))
-		}
-		_ = s.cfg.Driver.StartPairing(ctx, onQR, onPairSuccess)
+		_ = s.flow.start()
 	}
 }
 

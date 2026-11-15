@@ -1,7 +1,13 @@
 package mcp
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -16,6 +22,7 @@ var expectedToolNames = []string{
 	"edit_message",
 	"get_blocklist",
 	"get_chat",
+	"get_chat_labels",
 	"get_group_info",
 	"get_group_invite_link",
 	"get_message_context",
@@ -26,12 +33,15 @@ var expectedToolNames = []string{
 	"join_group_with_link",
 	"leave_group",
 	"list_chats",
+	"list_chats_by_label",
 	"list_groups",
+	"list_labels",
 	"list_messages",
 	"mark_chat_read",
 	"mark_read",
 	"pairing_status",
 	"request_sync",
+	"resync_labels",
 	"search_contacts",
 	"send_audio_message",
 	"send_contact_card",
@@ -49,6 +59,7 @@ var expectedToolNames = []string{
 	"set_group_topic",
 	"set_privacy_setting",
 	"set_status_message",
+	"transcribe_audio",
 	"unblock_contact",
 	"update_group_participants",
 }
@@ -57,7 +68,7 @@ func TestNewServer_RegistersAllTools(t *testing.T) {
 	// The client is only used inside handler closures — none of those run at
 	// registration time. Passing nil keeps the test hermetic (no whatsmeow,
 	// no sqlite, no network).
-	s := NewServer(nil, nil)
+	s := NewServer(nil, nil, true)
 	if s == nil {
 		t.Fatal("NewServer returned nil")
 	}
@@ -115,10 +126,22 @@ func TestNewServer_RegistersAllTools(t *testing.T) {
 }
 
 func TestNewServer_ToolCount(t *testing.T) {
-	s := NewServer(nil, nil)
-	const want = 42
+	s := NewServer(nil, nil, true)
+	const want = 47
 	if got := len(s.MCP().ListTools()); got != want {
 		t.Errorf("tool count = %d, want %d", got, want)
+	}
+}
+
+func TestNewServer_LabelsDisabledDoesNotAdvertiseLabelTools(t *testing.T) {
+	s := NewServer(nil, nil, false)
+	for _, name := range []string{"list_labels", "list_chats_by_label", "get_chat_labels", "resync_labels"} {
+		if s.MCP().GetTool(name) != nil {
+			t.Errorf("label tool %q is advertised while labels are disabled", name)
+		}
+	}
+	if got := len(s.MCP().ListTools()); got != 43 {
+		t.Fatalf("default tool count = %d, want 43", got)
 	}
 }
 
@@ -130,17 +153,19 @@ func TestNewServer_ToolCount(t *testing.T) {
 // is maintained manually — if a domain file is added or a tool is renamed the
 // test must be updated.
 func TestToolsByDomain(t *testing.T) {
-	s := NewServer(nil, nil)
+	s := NewServer(nil, nil, true)
 	got := s.MCP().ListTools()
 
 	// domain file → representative tool name(s) that MUST be present.
 	domains := map[string][]string{
-		"tools_query.go":   {"list_chats", "search_contacts"},
-		"tools_send.go":    {"send_message", "send_file"},
-		"tools_message.go": {"edit_message", "mark_read"},
-		"tools_groups.go":  {"create_group", "leave_group"},
-		"tools_media.go":   {"send_poll", "send_contact_card"},
-		"tools_privacy.go": {"get_blocklist", "send_presence"},
+		"tools_query.go":      {"list_chats", "search_contacts"},
+		"tools_send.go":       {"send_message", "send_file"},
+		"tools_message.go":    {"edit_message", "mark_read"},
+		"tools_groups.go":     {"create_group", "leave_group"},
+		"tools_media.go":      {"send_poll", "send_contact_card"},
+		"tools_labels.go":     {"list_labels"},
+		"tools_privacy.go":    {"get_blocklist", "send_presence"},
+		"tools_transcribe.go": {"transcribe_audio"},
 	}
 
 	for file, names := range domains {
@@ -149,5 +174,101 @@ func TestToolsByDomain(t *testing.T) {
 				t.Errorf("domain %s: expected tool %q not registered", file, name)
 			}
 		}
+	}
+}
+
+var expectedReadOnlyTools = map[string]bool{
+	"download_media":       true,
+	"get_blocklist":        true,
+	"get_chat":             true,
+	"get_chat_labels":      true,
+	"get_group_info":       true,
+	"get_message_context":  true,
+	"get_poll_results":     true,
+	"get_privacy_settings": true,
+	"get_status":           true,
+	"is_on_whatsapp":       true,
+	"list_chats":           true,
+	"list_chats_by_label":  true,
+	"list_groups":          true,
+	"list_labels":          true,
+	"list_messages":        true,
+	"pairing_status":       true,
+	"request_sync":         true,
+	"resync_labels":        true,
+	"search_contacts":      true,
+}
+
+func TestReadOnlyServer_RejectsMutationTools(t *testing.T) {
+	s := NewReadOnlyServer(nil, nil, true)
+	got := s.MCP().ListTools()
+	if len(got) != len(expectedReadOnlyTools) {
+		t.Fatalf("read-only tools = %d, want %d", len(got), len(expectedReadOnlyTools))
+	}
+	for name := range expectedReadOnlyTools {
+		if got[name] == nil {
+			t.Errorf("read-only tool %q missing", name)
+		}
+	}
+
+	mux := http.NewServeMux()
+	s.AttachHTTP(mux)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+	for _, name := range expectedToolNames {
+		if expectedReadOnlyTools[name] {
+			continue
+		}
+		t.Run(name, func(t *testing.T) {
+			body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":%q,"arguments":{}}}`, name)
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, httpServer.URL+"/mcp", strings.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			var envelope struct {
+				Error *struct {
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+				t.Fatal(err)
+			}
+			if envelope.Error == nil || !strings.Contains(envelope.Error.Message, "not found") {
+				t.Fatalf("mutation tool %q was not rejected: %+v", name, envelope)
+			}
+		})
+	}
+}
+
+func TestEveryToolHasReadOnlyClassification(t *testing.T) {
+	tools := NewServer(nil, nil, true).MCP().ListTools()
+	for name := range tools {
+		if _, ok := readOnlyToolAccess[name]; !ok {
+			t.Errorf("tool %q has no reviewed access classification", name)
+		}
+	}
+	for name := range readOnlyToolAccess {
+		if tools[name] == nil {
+			t.Errorf("access classification names unregistered tool %q", name)
+		}
+	}
+}
+
+func TestReadOnlyServer_InstructionsReportMode(t *testing.T) {
+	s := NewReadOnlyServer(nil, nil, false)
+	response := s.MCP().HandleMessage(context.Background(), json.RawMessage(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`))
+	raw, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "read-only") {
+		t.Fatalf("initialize does not report the mode: %s", raw)
 	}
 }
